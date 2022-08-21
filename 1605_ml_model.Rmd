@@ -1,0 +1,1299 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+
+```{r}
+
+
+library(tibble)
+library(dplyr)
+library(readr)
+library(ggplot2)
+
+library(tensorflow)
+library(keras)
+library(reticulate)
+library(devtools)
+library(reticulate)
+library(zoo)
+library(data.table)
+library(xts)
+library(forecast) #Acf function
+library(lubridate)
+library(PerformanceAnalytics) # for function kurtosis()
+library(tseries)#adf and jb test
+library(rugarch)
+
+library(sjPlot)
+library(stargazer)
+
+library(broom)
+library(purrr) #for test tables
+
+library(lmtest)
+library(plyr)
+
+library(texreg)
+#if(!require(devtools)) install.packages("devtools")
+#devtools::install_github("kassambara/ggpubr")
+#install.packages(remotes)
+#remotes::install_github("freysimon/TigR")
+
+library(ggpubr)
+
+
+```
+
+Once the data prep functions are defined, can every code chunk be run independetly to generate the GARCH and LSTM model estimates, tables and plots for each currency and daily or hourly timeframe
+path to the local data file, this should be enough for R markdown since it usually recognized its environment
+otherwise define fill system path here
+coin variable will be used in loops to generate plots and tables
+```{r}
+#path = "Data/"
+path = "D:/Google Drive/MBF/Masterarbeit/Data/"
+coin <- c("BTC","ETH","LTC")
+start_date <- ymd("2019/6/30")
+end_date <- ymd("2022/5/1")
+set.seed(123)
+options("scipen"=100, "digits"=6) #no scientific not
+```
+
+
+
+
+# Data Loading and Preprocessing 
+Custom functions for later use to pull the necessary data, preprocess and generate the statistics
+```{r}
+get_stats <- function(tab){
+  df <- data.frame("var"=c("Sample size","Mean","Std","Min","Max","Skewness","Excess kurtosis"),
+                 curr=c(nrow(tab),mean(tab),StdDev(tab),min(tab),max(tab),
+                        skewness(tab),
+                        kurtosis(tab, method = "excess")))
+  return (df)
+}
+
+
+#####################################
+get_test_stats <- function(tab,lag){
+#Ljung box for autocorrelation
+l1 <- Box.test(tab, lag = lag, type = "Ljung-Box")
+#H0 no autocorrelation 
+
+#augmented dickey fuller test for unit root
+adft <- adf.test(tab)
+#H0 unit root
+
+# test for non normality with the jarque bera
+jbt <- jarque.bera.test(tab)
+
+
+tab <- map_df(list(l1,jbt,adft), tidy)
+tab <- tab[,c("method","statistic","p.value")]
+tab[1,1] <- c("Box-Ljung Test")
+  return(tab)
+}
+
+
+#######################################
+get_h_data <- function(curr){
+  dat_h <- read.csv(paste0(path,"Price/Hour/Cryptocompare/",curr,"_price.csv"))
+colnames(dat_h) <- c("ts","high","low","open","close","volume")
+dat_h$ts <- ymd_hms(dat_h$ts)
+  
+#xts time format
+dat_h <- as.xts(dplyr::select(dat_h, -c(ts)) , order.by = dat_h$ts)
+
+#log returns and vol change
+dat_h$ret <- diff(log(dat_h$close))
+dat_h$v_chg <- diff(log(dat_h$volume))
+
+dat_h$ret2 <- dat_h$ret^2 #squared returns
+dat_h$rv <- rollsum(dat_h$ret2,24,fill=NA,align="right") #24h variance as sum of sqr returns
+
+#remove NA 
+dat_h <- na.omit(dat_h)
+dat_h <- dat_h[!is.infinite(dat_h$v_chg),]
+
+#match dates
+dat_h <- dat_h[index(dat_h)>start_date]
+dat_h <- dat_h[index(dat_h)<end_date]
+return(dat_h)
+}
+
+
+
+############################################
+get_d_data <- function(curr){
+dat_d <- read.csv(paste0(path,"Price/Day/Cryptocompare/",curr,"_price.csv"))
+colnames(dat_d) <- c("ts","high","low","open","close","volume")
+dat_d$ts <- ymd(dat_d$ts)
+
+dat_d <- as.xts(dplyr::select(dat_d, -c(ts)) , order.by = dat_d$ts)
+dat_d$ret <- diff(log(dat_d$close))
+dat_d$v_chg <- diff(log(dat_d$volume))
+
+dat_d$ret2 <- dat_d$ret^2 #squared returns
+
+#remove NA 
+dat_d <- na.omit(dat_d)
+dat_d <- dat_d[!is.infinite(dat_d$v_chg),]
+
+dat_d <- dat_d[index(dat_d)>start_date]
+dat_d <- dat_d[index(dat_d)<end_date]
+
+return(dat_d)
+}
+
+##########################################
+get_fun_dat <- function(curr){
+  #FTX
+  dat_funftx <- read.csv(paste0(path,"Funding/FTX_",curr,"_funding.csv"))
+  dat_funftx <- dat_funftx[,c("rate","ts")]
+  colnames(dat_funftx) <- c("ftx","ts")
+  dat_funftx$ts <- as.POSIXct(dat_funftx$ts,format="%d.%m.%Y %H:%M")
+  #dat_funftx$ts <- lubridate::dmy_hms(dat_funftx$ts)
+  
+  #BINANCE
+  dat_funbin <- read.csv(paste0(path,"Funding/BINANCE_",curr,"_funding.csv",sep = ""))
+  dat_funbin <- dat_funbin[,c("ï..Time","Funding.Rate")]
+  colnames(dat_funbin) <- c("ts","bin")
+  dat_funbin$bin <- as.numeric(sub("%", "", dat_funbin$bin))/100 #convert from pct string to number
+  dat_funbin$ts <- as.POSIXct(dat_funbin$ts,format="%d.%m.%Y %H:%M")
+  bin_fun_start <- min(dat_funbin$ts)
+  
+  #BITMEX
+  dat_funbit <- read.csv(paste0(path,"Funding/BITMEX_",curr,"_funding.csv"))
+  dat_funbit <- dat_funbit[,c("timestamp","funding")]
+  colnames(dat_funbit) <- c("ts","bit")
+  dat_funbit$ts <- as.POSIXct(dat_funbit$ts,format="%Y-%m-%d %H:%M")
+  
+  #merge binance and bitmex
+  dat_fun <- merge(dat_funbit,dat_funbin,on="ts", all = TRUE)
+  #divide by eight to get to hourly rates
+  dat_fun[,c("bin","bit")] <- dat_fun[,c("bin","bit")]/8
+  #backfill the NA timeseries
+  dat_fun$bin <- nafill(dat_fun$bin, type = "locf")
+  
+  #merge with FTX
+  dat_fun <- merge(dat_fun,dat_funftx, on="ts",all=TRUE)
+  
+  
+  #rowsums, but if all entries are NA, keep the NA value instead of replacing it with 0
+  dat_fun$funding <- rowSums(dat_fun[,c("ftx","bin","bit")], na.rm=TRUE) * ifelse(rowSums(is.na(dat_fun[,c("ftx","bin","bit")])) == ncol(dat_fun[,c("ftx","bin","bit")]),NA,1)
+  #divide by number of exchanges that contributed to the sum
+  dat_fun$funding <- dat_fun$funding / rowSums(!is.na(dat_fun[,c("bit","bin","ftx")]))
+  
+  #remove NA funding
+  dat_fun <- dat_fun[!is.na(dat_fun$funding),]
+  
+  #remove NA in time
+  dat_fun <- dat_fun[!is.na(dat_fun$ts),]
+  
+  dat_fun$funding <- dat_fun$funding*100
+  
+  #xts format
+  dat_fun <- as.xts(dat_fun[,-1],order.by = dat_fun[,1])
+
+  #start end
+  dat_fun <- dat_fun[index(dat_fun)>start_date]
+  dat_fun <- dat_fun[index(dat_fun)<end_date]
+  return(dat_fun)
+}
+
+
+####################
+get_fee_dat <- function(curr){
+  
+dat_fee <- read.csv(paste0(path,"Fee/",curr,"_fee.csv"))
+head(dat_fee)
+dat_fee <- dat_fee[,c("time","FeeMeanUSD")]
+colnames(dat_fee) <- c("ts","fee")
+dat_fee$ts <- lubridate::ymd_hms(dat_fee$ts)
+dat_fee <- xts(dat_fee[,-1],order.by = dat_fee[,1])
+colnames(dat_fee) <- "fee"
+
+#start end
+dat_fee <- dat_fee[index(dat_fee)>start_date]
+dat_fee <- dat_fee[index(dat_fee)<end_date]
+
+#normalize by price of currency
+# get daily data
+dat_d <- get_d_data(curr)
+dat_fee$fee <- dat_fee$fee/dat_d$close * 100
+
+#na
+dat_fee <- na.omit(dat_fee)
+return(dat_fee)
+}
+
+
+##############################################
+get_social_dat <- function(curr){
+  #load and format the data
+dat_social <- read.csv(paste0(path,"Social/Hour/",curr,"_social.csv"))
+head(dat_social)
+colnames(dat_social) <- c("ts","reddit_c","reddit_p","reddit_sub")
+dat_social$ts <- lubridate::dmy_hm(dat_social$ts)
+dat_social <- xts(dat_social[,-1],order.by = dat_social[,1])
+
+#start end
+dat_social <- dat_social[index(dat_social)>start_date]
+dat_social <- dat_social[index(dat_social)<end_date]
+
+#normalize by subscriber count
+dat_social$reddit_c_n <- dat_social$reddit_c / dat_social$reddit_sub * 100
+    dat_social$reddit_p_n <- dat_social$reddit_p / dat_social$reddit_sub * 100
+return(dat_social)
+}
+```
+
+
+function to extract GARCH parameters
+```{r}
+extract.rugarch <- function(fit, 
+                            include.rsquared = F, include.loglike = TRUE, include.aic = TRUE, include.bic = TRUE) {
+  
+  # extract coefficient table from fit:
+  coefnames <- rownames(as.data.frame(fit@fit$coef))
+  coefs <- fit@fit$coef
+  se <- as.vector(fit@fit$matcoef[, c(2)])
+  pvalues <-  as.vector(fit@fit$matcoef[, c(4)])       # numeric vector with p-values
+  
+  # create empty GOF vectors and subsequently add GOF statistics from model:
+  gof <- numeric()
+  gof.names <- character()
+  gof.decimal <- logical()
+  if (include.rsquared == TRUE) {
+    r2 <-  1 - (var(fit@fit$residuals) / var(y))
+    gof <- c(gof, r2)
+    gof.names <- c(gof.names, "R^2")
+    gof.decimal <- c(gof.decimal, TRUE)
+  }
+  if (include.loglike == TRUE) {
+    loglike <- fit@fit$LLH
+    gof <- c(gof, loglike)
+    gof.names <- c(gof.names, "Log likelihood")
+    gof.decimal <- c(gof.decimal, TRUE)
+  }
+  if (include.aic == TRUE) {
+    aic <- infocriteria(fit)[c(1)]
+    gof <- c(gof, aic)
+    gof.names <- c(gof.names, "AIC")
+    gof.decimal <- c(gof.decimal, TRUE)
+  }
+  
+  if (include.bic == TRUE) {
+    bic <- infocriteria(fit)[c(2)]
+    gof <- c(gof, bic)
+    gof.names <- c(gof.names, "BIC")
+    gof.decimal <- c(gof.decimal, TRUE)
+  }
+
+  d_inf <- data.frame("Criteria"=gof.names,"Value"=gof)
+  tr <- data.frame("Parameter"=coefnames,"Estimate"=coefs,"Standard Error"=se,"P.value"=pvalues)
+  return(list(tr,d_inf))
+}
+
+
+
+```
+
+get significance stars
+```{r}
+#get significance starts
+stars.pval <- function(x){
+  stars <- c("***", "**", "*", " ")
+  var <- c(0, 0.01, 0.05, 0.10, 1)
+  i <- findInterval(x, var, left.open = T, rightmost.closed = T)
+  stars[i]
+}
+```
+
+
+Load and analyze price and volume data,generate plots and tables
+time frame/period and currency can be selected
+
+```{r}
+curr = "ETH"
+t_period = "hour"
+
+
+df_all <- data.frame()
+
+for (i in coin) {
+  curr = i
+
+  if (t_period == "day") {
+  dat_price <- get_d_data(curr)
+  }
+  if (t_period == "hour"){
+  dat_price <- get_h_data(curr)
+  }
+
+
+############
+# explore the data
+############
+
+# #partial autocorrelation
+# q <- forecast::ggtsdisplay(dat_price$ret,lag.max=30)
+# q <- q + theme(panel.background = element_rect(fill = 'white', colour = 'black'))
+# q <- q + ggtitle(curr) + ggtitle(curr)
+# q
+# ggsave(q, filename = paste0(path,"Plots/",curr,"_pAcF_daily.png"),height = 2.5, width = 9)  
+
+#partial autocorrelation returns
+q <- forecast::ggtsdisplay(dat_price$ret,lag.max=30)
+q <- q + theme(panel.background = element_rect(fill = 'white', colour = 'black'))
+q <- q + ggtitle(" ") + labs(y= "PACF Returns")
+q
+#ggsave(q, filename = paste0(path,"Plots/",curr,"_pAcF_ret_hourly.png"),height = 2.5, width = 9)  
+
+#partial autocorrelation squared returns
+p <- forecast::ggtsdisplay(dat_price$ret2,lag.max=30)
+p <- p + theme(panel.background = element_rect(fill = 'white', colour = 'black'))
+p <- p + ggtitle(curr) + labs(y= "PACF Returns^2")
+p
+#ggsave(p, filename = paste0(path,"Plots/",curr,"_pAcF_ret2_hourly.png"),height = 2.5, width = 9)  
+
+pq_plot <- ggarrange(p, q, heights = c(2, 2),
+          ncol = 2, nrow = 1,align = "h")
+print(pq_plot)
+ggsave(pq_plot, filename = paste0(path,"Plots/",curr,"_",t_period,"_daily_pacf_all.png"),height = 2, width = 9)
+
+
+
+#test statistics
+tab <- get_test_stats(dat_price$ret,lag=10)
+#assign(paste0("tab_test",curr),tab)
+colnames(tab) <- c("var",curr,"pvalue")
+#summaty stats
+df <- get_stats(dat_price$ret)
+colnames(df) <- c("var",curr)
+df$pvalue <- NA
+df = join(df,tab,type="full")
+df <- transform(df, stars = stars.pval(df$pvalue))
+df$pvalue <- NULL
+if (dim(df_all)[1] == 0){
+  df_all <- df
+  }else{
+ df_all <- join(df_all,df,by="var") 
+}
+}
+
+
+
+
+
+#df_all <- transform(df_all, stars = stars.pval(df_all$pvalue))
+
+#colnames(df_all) <- c(" ",coin)
+tab_df(df_all,digits = 4, 
+          file = paste0(path,"Tables/",t_period,"summary_stats.doc"))
+
+
+
+```
+
+
+plot the funding data
+
+```{r}
+#coin <- c("BTC","ETH","LTC")
+#l_fund <- list() #ggplots in list not working
+#i = "LTC"
+for (i in coin) {
+  curr = i
+  dat_fun <- get_fun_dat(curr)
+  
+  #create plot
+  fplot <- autoplot(dat_fun[,("funding")]) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + theme(panel.background = element_rect(fill = 'white', colour = 'black')) + labs(y= "Funding rate (%/h)", x = "Date") + ggtitle(curr) 
+  print(fplot)
+  #ggsave(fplot, filename = paste0("Plots/",curr,".png"),height = 2.5, width = 9)
+  #build seperate variables for comboplot
+  assign(paste0("fplot",curr),fplot)
+  #l_fund[i] <- fplot
+}
+fplot_all <- ggarrange(fplotBTC, fplotETH, fplotLTC, heights = c(2, 2, 2),
+          ncol = 1, nrow = 3,align = "v")
+
+fplot_all
+ggsave(fplot_all, filename = paste0(path,"Plots/","all_f",".png"),height = 7, width = 9)
+hist(dat_fun$funding)
+
+```
+
+
+
+Transaction fee
+```{r}
+#curr <- "ETH"
+
+for (i in coin) {
+  curr = i
+dat_fee <- get_fee_dat(curr)
+
+
+#adf test
+adf.test(dat_fee$fee)
+
+#create plot
+  fee_plot <- autoplot(dat_fee) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + theme(panel.background = element_rect(fill = 'white', colour = 'black')) + labs(y= "avg Transaction Fee (%)", x = "Date") + ggtitle(curr) 
+  #print(fee_plot)
+  fee_plot
+  assign(paste0("feeplot",curr),fee_plot)
+  #ggsave(fee_plot, filename = paste0(path,"Plots/",curr,"_fee.png"),height = 2, width = 9)
+  hist(dat_fee)
+  dat_fee$fee_chg <- diff(log(dat_fee$fee))
+  #na
+  dat_fee <- na.omit(dat_fee)
+  autoplot(dat_fee$fee_chg)
+}
+fplot_all <- ggarrange(feeplotBTC, feeplotETH, feeplotLTC, heights = c(2.5, 2.5, 2.5),
+          ncol = 1, nrow = 3,align = "v")
+
+fplot_all
+ggsave(fplot_all, filename = paste0(path,"Plots/","all_fees",".png"),height = 7, width = 9)
+
+```
+
+
+Reddit Data
+```{r}
+#curr <- "BTC"
+for (i in coin){
+#load and format the data
+  curr = i
+dat_social <- get_social_dat(curr)
+
+
+#create plot
+  social_plotc <- autoplot(dat_social[,1]) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + theme(panel.background = element_rect(fill = 'white', colour = 'black')) + labs(y= "Reddit Comments per Hour", x = "Date") + ggtitle(" ") 
+  print(social_plotc)
+  #ggsave(social_plotc, filename = paste0("Plots/",curr,"_social_c.png"),height = 2.5, width = 9)
+
+    social_plotp <- autoplot(dat_social[,2]) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + theme(panel.background = element_rect(fill = 'white', colour = 'black')) + labs(y= "Reddit Posts per Hour", x = "Date") + ggtitle(curr) 
+  print(social_plotp)
+  #ggsave(social_plotp, filename = paste0("Plots/",curr,"_social_p.png"),height = 2.5, width = 9)  
+
+  social_plot_all <- ggarrange(social_plotp, social_plotc, heights = c(0.5),
+          ncol = 2, nrow = 1)
+  social_plot_all
+  ggsave(social_plot_all, filename = paste0(path,"Plots/",curr,"_social_all_p.png"),height = 2, width = 9)  
+}
+```
+
+summary stats for the external regressors
+```{r}
+curr <- "BTC"
+t_period <- "hour"
+df_all <- data.frame()
+for (i in coin) {
+ curr=i
+#### get the data
+dat_d <- get_d_data(curr)
+dat_h <- get_h_data(curr)
+dat_social <- get_social_dat(curr)
+dat_fun <- get_fun_dat(curr)
+dat_fee <- get_fee_dat(curr)
+####
+dat_stats <- prep_h_data(dat_h,dat_fee,dat_fun,dat_social)
+#test statistics
+tab <- get_test_stats(dat_stats[,3],lag=10)
+#assign(paste0("tab_test",curr),tab)
+colnames(tab) <- c("var",curr,"pvalue")
+#summaty stats
+autoplot(dat_stats$reddit_p_n)
+df <- get_stats(dat_stats[,3])
+colnames(df) <- c("var",curr)
+df$pvalue <- NA
+df = join(df,tab,type="full")
+df <- transform(df, stars = stars.pval(df$pvalue))
+df$pvalue <- NULL
+if (dim(df_all)[1] == 0){
+  df_all <- df
+  }else{
+ df_all <- join(df_all,df,by="var") 
+}
+}
+tab_df(df_all, digits = 4)
+```
+
+
+Simple GARCH model with no external regressors
+
+```{r}
+curr = "BTC"
+out_sample_d = round(0.35*nrow(dat_d)) #35% of the data are used out of sample
+out_sample_h = round(0.35*nrow(dat_h)) #35% of the data are used out of sample
+
+#### get the data
+dat_d <- get_d_data(curr)
+dat_h <- get_h_data(curr)
+dat_social <- get_social_dat(curr)
+dat_fun <- get_fun_dat(curr)
+dat_fee <- get_fee_dat(curr)
+####
+
+
+
+#Garch 1,1 model with zero mean
+garchspec <- ugarchspec(
+  mean.model = list(armaOrder = c(0,0)),
+  variance.model =  list(model = "sGARCH", garchOrder = c(1, 1)),
+  distribution.model = "std")
+
+garchfit <- ugarchfit(data = dat_d$ret,
+                      spec = garchspec,
+                      out.sample = out_sample_d)
+
+garchfit
+
+#forecast
+# spec = getspec(garchfit);
+# setfixed(spec) <- as.list(coef(garchfit));
+# forecast = ugarchforecast(spec, n.ahead = 1, n.roll = 100, data = dat_d$ret[100:300], out.sample = 100)
+forecast = ugarchforecast(garchfit,n.ahead = 1, n.roll = out_sample_d,out.sample = out_sample_d)
+
+####
+#compare forecast to target
+dat_rv_d <- apply.daily(dat_h$ret2, FUN = sum)
+index(dat_rv_d) <- as.Date(index(dat_rv_d))
+colnames(dat_rv_d) <- "rv"
+
+
+
+g_fc <- sigma(forecast)
+g_fc <- t(g_fc)
+
+#g_fc <- data.frame(g_fc)
+#g_fc$T.1 <- lag(g_fc$T.1) #lag to have the prediction on prediction day
+#g_fc <- as.xts(g_fc)
+#index(g_fc) <- as.Date(index(g_fc))
+
+
+if (t_period == "day"){
+g_fc <- data.frame(g_fc)
+g_fc$date <- rownames(g_fc)
+rownames(g_fc) <- NULL
+g_fc$T.1 <- lag(g_fc$T.1,n=1) #lag to have the prediction on prediction day
+g_fc <- na.omit(g_fc)
+g_fc <- as.xts(g_fc$T.1, order.by = ymd(g_fc$date))
+g_fc <- merge(g_fc,dat_data_d$rv)
+}
+
+
+g_fc <- merge(g_fc,dat_rv_d)
+g_fc <- na.omit(g_fc)
+
+#get error statistics
+g_acc <- accuracy(as.numeric(g_fc$T.1),as.numeric(g_fc$rv))
+g_acc
+
+# tab <- map_df(list(g_acc,g_acc), tidy)
+# tab <- tab[,c("method","statistic","p.value")]
+# tab[1,1] <- c("Box-Ljung Test")
+#   return(tab)
+# }
+
+
+#plot vs prediction
+  p <- ggplot(g_fc, aes(x=index(g_fc), y = rv)) + geom_point( colour = "blue", size = 0.3,alpha=0.5)
+  p <- p + geom_point(aes(y = g_fc$T.1^2) ,colour = "red", size = 0.3 ,alpha=0.5) 
+  p <- p + theme(panel.background = element_rect(fill = 'white', colour = 'black')) + 
+    labs(y= "RV", x = "Date") + ggtitle(curr) 
+  p <- p +  scale_x_date(date_breaks = "3 month",date_labels = "%Y %b")
+  p 
+  ggsave(p, filename = paste0(path,"Plots/",curr,"_simple_garch.png"),height = 3, width = 9)  
+
+  #scatterplot remove one outlier
+  g_fc <- g_fc[which(!g_fc$rv==max(g_fc$rv)),] 
+  ggplot(g_fc, aes(x=T.1^2, y=rv)) +
+  geom_point(size=2, shape=23)
+
+#extract garch params and print table  
+g_tab <- extract.rugarch(garchfit)
+
+tab_dfs(list(g_tab[[1]],g_tab[[2]]),title=c(curr,curr),
+        file = paste0(path,"Tables/",curr,"simple_garch.doc"))
+
+
+
+```
+
+Grid search for optimal parameter estimation
+```{r, eval = FALSE}
+#grid search over different parameters
+final.aic <- Inf
+final.order <- c(0,0,0,0)
+for (i in 0:0) for (j in 0:0) for (k in 1:4) for(l in 1:4) {
+  garchspec <- ugarchspec(
+    mean.model = list(armaOrder = c(i,j)),
+    variance.model =  list(model = "sGARCH", garchOrder = c(k, l)),
+    distribution.model = "std")
+  garchfit <- ugarchfit(data = dat_d$ret,
+                        spec = garchspec,
+                        out.sample = out_sample_d)
+
+  if (garchfit@fit$convergence == 0){
+    current.aic <- infocriteria(garchfit)[1]
+    if (current.aic*0.98 < final.aic) #1% improvement
+      final.aic <- current.aic
+    final.order <- c(i, j, k, l)
+  }
+}
+```
+
+
+helper function to prep the hourly data
+```{r}
+prep_h_data <- function(dat_h,dat_fee,dat_fun,dat_social){
+
+dat_data <-  merge(dat_h[,c("rv","ret","ret2","v_chg")], dat_fee$fee, dat_fun[,"funding"],
+                  dat_social[,c("reddit_c_n","reddit_p_n")])
+
+#cut of leading and trailing NA in the fee chg for the interpolation 
+dat_data <- dat_data[min(which(!is.na(dat_data$fee))):max(which(!is.na(dat_data$fee))),]
+dat_data$fee <- na.spline(dat_data[,c("fee")], xout = index(dat_data))
+#take log diff
+dat_data$fee <- diff(log(dat_data$fee))
+
+#nas
+dat_data <- na.omit(dat_data)
+return (dat_data)
+}
+```
+
+helper function to prep daily data
+```{r}
+prep_d_data <- function(dat_d,dat_fee,dat_fun,dat_social) {
+dat_data_d <- dat_d[,c("ret","ret2","v_chg")]
+
+#transform daily
+col_sum <- function(x, na.rm = FALSE) {
+  apply(x, 2, sum, na.rm = na.rm)
+}
+#data is summed including end of day 23:00, index is matched to daily price series
+dat_social_d = apply.daily(dat_social, FUN = col_sum)
+index(dat_social_d) <- as.Date(index(dat_social_d))
+dat_data_d <- merge(dat_data_d,dat_social_d)
+
+dat_funding_d <- apply.daily(dat_fun$funding, FUN = sum)
+index(dat_funding_d) <- as.Date(index(dat_funding_d))
+dat_data_d <- merge(dat_data_d,dat_funding_d)
+
+dat_rv_d <- apply.daily(dat_h$ret2, FUN = sum)
+index(dat_rv_d) <- as.Date(index(dat_rv_d))
+colnames(dat_rv_d) <- "rv"
+
+
+dat_data_d <- merge(dat_data_d,dat_rv_d)
+dat_data_d <- merge(dat_data_d,dat_fee)
+dat_data_d <- na.omit(dat_data_d)
+
+dat_data_d <- dat_data_d[,c("rv","v_chg","reddit_c_n","reddit_p_n","funding","ret","fee")]
+
+head(dat_data_d)
+dat_data_d$ret2 <- dat_data_d$ret^2
+return(dat_data_d)
+}
+```
+
+correlation analysis
+```{r}
+curr = "BTC"
+t_period <- "hour" #day #choose for the model forecast, to adjust the model forecast length, dataselection and 
+method <- "pearson"
+df_all <- data.frame() #collect the tables
+
+l_cor <- list()
+# get_garch <- function(curr){
+for (i in coin) {
+    curr = i
+#### get the data
+dat_d <- get_d_data(curr)
+dat_h <- get_h_data(curr)
+dat_social <- get_social_dat(curr)
+dat_fun <- get_fun_dat(curr)
+dat_fee <- get_fee_dat(curr)
+####
+###########################
+if (t_period == "day"){
+garch_data <- prep_d_data(dat_d = dat_d,dat_fee = dat_fee,dat_fun=dat_fun,dat_social)
+}
+
+if (t_period == "hour"){
+garch_data <- prep_h_data(dat_h,dat_fee,dat_fun,dat_social)
+}
+##########################
+# #correlation matrix
+dat_corr <- as.data.frame(garch_data[,-1])
+#dat_corr$date <- rownames(dat_corr)
+rownames(dat_corr) <- NULL
+dat_corr[,c("v_chg","fee","funding","reddit_c_n","reddit_p_n")] <- 
+lag(dat_corr[,c("v_chg","fee","funding","reddit_c_n","reddit_p_n")])
+dat_corr <- na.omit(dat_corr)
+dat_corr$ret <- NULL
+head(dat_corr)
+dat_corr <- dat_corr[,c("ret2","v_chg","fee","funding","reddit_p_n","reddit_c_n")]
+colnames(dat_corr) <- c("r2","Volume","Fee","Funding","RedditCom","RedditPost")
+tab_corr(dat_corr,corr.method = c(method),fade.ns = F,title = curr,
+         file = paste0(path,"/Tables/","corr_",curr,t_period,".doc"))
+l_cor[[i]] <- dat_corr
+
+}
+
+
+
+
+# name = "LTC"
+tab_corr(l_cor[[name]],corr.method = c(method),fade.ns = F,title = name)
+tab_corr(l_cor[[name]],corr.method = c(method),fade.ns = F,title = name,
+ file = paste0(path,"/Tables/","corr_",name,t_period,".doc"))
+# cor(dat_corr)
+# plot(dat_corr$r2,dat_corr$Fee)
+# stat_cor(
+#   mapping = NULL,
+#   data = dat_corr[,c(1:2)],
+#   method = "spearman"
+# )
+
+#currency correlation 
+h_rets <- lapply(coin, get_h_data)
+h_rets <- merge(h_rets[[1]],h_rets[[2]],h_rets[[3]], all.x=TRUE, all.y=TRUE)
+h_rets <- h_rets[,c("ret","ret.1","ret.2")]
+colnames(h_rets) <- coin
+tab_df(as.data.frame(cor(h_rets),method = method),file=paste0(path,"/Tables/","currency_corr_",method,t_period,".doc"),show.rownames = T)
+
+ll <- lapply(l_cor,FUN=cor,method=method)
+df <- as.data.frame(do.call(rbind,unname(ll)))
+library(psych)
+corr.test(l_cor$BTC, method = method)
+?corr.test
+ll$BTC
+#tab_df(df,show.rownames = T)
+tab_df(df,show.rownames = T,file=paste0(path,"/Tables/","all_corr_",method,t_period,".doc"))
+
+
+# ggscatter(l_cor$BTC, x = "r2", y = "Fee",
+#           color = "blue", cor.coef = TRUE, 
+#           cor.method = "spearman",
+#           xlab = "Brent (TL)", ylab = "Gasoline (TL)")
+
+# for (name in names(l_cor)) {
+#     print(name)
+#     print(l_cor[[name]])
+#         tab_corr(l_cor[[name]],corr.method = c("pearson"),fade.ns = F,title = curr,
+#          file = paste0(path,"/Tables/","corr_",name,t_period,".doc"))
+```
+
+
+Garch with additional parameters
+```{r}
+out_sample_d = 0.35 #35% of the data are used out of sample dor daily timeframe
+out_sample_h = 0.35  #35% of the data are used out of sample for hourly time frame
+
+curr = "BTC"
+t_period <- "day" #day #choose for the model forecast, to adjust the model forecast length, dataselection and 
+#calculation of the forecast
+variab <- "full" #rets #full
+df_all <- data.frame() #collect the tables
+
+# get_garch <- function(curr){
+for (i in coin) {
+    curr = i
+#### get the data
+dat_d <- get_d_data(curr)
+dat_h <- get_h_data(curr)
+dat_social <- get_social_dat(curr)
+dat_fun <- get_fun_dat(curr)
+dat_fee <- get_fee_dat(curr)
+####
+###########################
+
+
+if (t_period == "day"){
+garch_data <- prep_d_data(dat_d = dat_d,dat_fee = dat_fee,dat_fun=dat_fun,dat_social)
+out_sample <- round(out_sample_d*nrow(dat_d))
+}
+
+if (t_period == "hour"){
+garch_data <- prep_h_data(dat_h,dat_fee,dat_fun,dat_social)
+out_sample <- round(out_sample_h*nrow(dat_h))
+}
+
+
+
+if (variab == "full"){
+
+# garch_data <- as.data.frame(garch_data)
+# rownames(garch_data) <- NULL
+# garch_data[,c("v_chg","fee","funding","reddit_c_n","reddit_p_n")] <- 
+# lag(garch_data[,c("v_chg","fee","funding","reddit_c_n","reddit_p_n")])
+garch_data <- na.omit(garch_data)
+# nrow(garch_data)
+#create external regressors
+regs <- subset(garch_data, select=c(v_chg,fee,funding,reddit_c_n,reddit_p_n))
+#regs <- subset(garch_data, select=c(fee))
+regs <- data.matrix(regs)
+regs <- lag(regs)
+regs <- na.omit(regs)
+
+garchspec <- ugarchspec(
+  mean.model = list(armaOrder = c(0,0)),
+  variance.model =  list(model = "sGARCH", garchOrder = c(1, 1), external.regressors = regs),
+  distribution.model = "std")
+}
+
+if (variab == "rets") {
+  garchspec <- ugarchspec(
+  mean.model = list(armaOrder = c(0,0)),
+  variance.model =  list(model = "sGARCH", garchOrder = c(1, 1)),
+  distribution.model = "std")
+}
+
+
+garchfit <- ugarchfit(data = garch_data$ret,
+                      spec = garchspec,resume_with_solver = "hybrid",
+                      out.sample = out_sample) 
+
+
+
+#forecast
+if (t_period=="hour"){
+forecast = ugarchforecast(garchfit,n.ahead = 24, n.roll = out_sample,out.sample = out_sample)
+}
+if (t_period=="day"){
+forecast = ugarchforecast(garchfit,n.ahead = 1, n.roll = out_sample,out.sample = out_sample)
+}
+
+g_fc <- sigma(forecast)
+g_fc <- t(g_fc)
+g_fc <- g_fc^2 #squared to match rv
+
+# ###day####
+if (t_period == "day"){
+g_fc <- data.frame(g_fc)
+g_fc$date <- rownames(g_fc)
+rownames(g_fc) <- NULL
+g_fc$T.1 <- lag(g_fc$T.1,n=1) #lag to have the prediction on prediction day
+g_fc <- na.omit(g_fc)
+g_fc <- as.xts(g_fc$T.1, order.by = ymd(g_fc$date))
+g_fc <- merge(g_fc,garch_data$rv)
+}
+##intraday
+if (t_period == "hour"){
+g_fc <- rowSums(g_fc)
+g_fc <- data.frame(g_fc)
+g_fc$date <- rownames(g_fc)
+rownames(g_fc) <- NULL
+g_fc$g_fc <- lag(g_fc$g_fc,n=24) #lag to have the prediction 24h later
+g_fc <- na.omit(g_fc)
+#rownames(g_fc) <- ymd_hms(rownames(g_fc))
+g_fc <- as.xts(g_fc$g_fc,order.by = ymd_hms(g_fc$date) )
+g_fc <- merge(g_fc,dat_h$rv)
+}
+
+
+g_fc <- na.omit(g_fc)
+colnames(g_fc) <- c("pred","rv")
+#get mean squared error
+g_acc <- accuracy(as.numeric(g_fc[,1]),as.numeric(g_fc[,2]))
+g_acc<- data.frame(t(g_acc))
+g_acc$Parameter <- rownames(g_acc)
+colnames(g_acc) <- c("Estimate","Parameter")
+
+#plot vs prediction
+  p <- ggplot(g_fc, aes(x=index(g_fc), y = rv)) + geom_line( colour = "blue", size = 0.2,alpha=0.3)
+  p <- p + geom_point(aes(y = g_fc$pred) ,colour = "red", size = 0.1 ,alpha=0.2) 
+  p <- p + theme(panel.background = element_rect(fill = 'white', colour = 'black')) + 
+    labs(y= "RV", x = "Date") + ggtitle(paste0(curr," GARCH"))
+  #p <- p +  scale_x_date(date_breaks = "3 month",date_labels = "%Y %b")
+  print(p) 
+  
+  ggsave(p, filename = paste0(path,"Plots/",curr,"_",t_period,"_",variab,"_garch.png"),height = 2, width = 9)  
+  
+  
+#extract garch params and print table  #"ar1","ma1","ar1","ar2","m_v_chg","m_fee","m_funding", "m_reddit_c_n","m_reddit_p_n",
+g_tab <- extract.rugarch(garchfit)
+if (variab == "full"){
+g_tab[[1]]$Parameter <- c("mu","omega","alpha1", "beta1", "v_chg","fee","funding", "reddit_c_n","reddit_p_n","shape")
+}
+
+if (variab == "ret"){
+g_tab[[1]]$Parameter <- c("mu","omega","alpha1", "beta1", "shape")
+}
+
+
+df <- tab_dfs(list(g_tab[[1]],g_tab[[2]]),title=c(curr,curr),digits=6)
+df
+
+
+#add significance stars
+g_tab[[1]] <- transform(g_tab[[1]], stars = stars.pval(g_tab[[1]]$P.value))
+g_tab[[1]] <- g_tab[[1]][,c("Parameter","Estimate","stars")]
+colnames(g_tab[[2]]) <- c("Parameter","Estimate")
+g_tab[[1]] <- bind_rows(g_tab[[1]],g_tab[[2]])
+g_tab[[1]] <- bind_rows(g_tab[[1]],g_acc)
+#g_tab[[1]] <- rbind(c("MeanModel"," "," "),g_tab[[1]])
+#g_tab[[1]] <- rbind(g_tab[[1]][1:7,],c("VarianceModel"," "," "),g_tab[[1]][-(1:7),])
+g_tab[[1]]$Estimate <- as.numeric(g_tab[[1]]$Estimate)
+
+df <- g_tab[[1]]
+colnames(df) <- c("Parameter",curr," ")
+
+if (dim(df_all)[1] == 0){
+  df_all <- df
+  }else{
+ df_all <- join(df_all,df,by="Parameter") 
+  }
+
+
+
+# as.numeric(g_tab[[1]]$Estimate)
+# tab_df(g_tab[[1]],col.header = c(" ",curr," "),digits = 4)
+#         file = paste0(path,"Tables/",curr,"_",t_period,"_",variab,"_garch.doc"))
+
+
+}
+
+
+#tab_df(df_all,col.header = c(" ",curr," "),digits = 6)
+tab_df(df_all,col.header = c(" ",curr," "),digits = 5,
+        file = paste0(path,"Tables/","all","_",t_period,"_",variab,"_garch.doc"))
+
+
+
+# return(g_tab[[1]])
+# }
+# df_garch <- lapply(coin,get_garch)
+# rind_rows(df_garch, .id = "Parameter")
+# tab_dfs(df_garch)
+# do.call("rbind",df_garch)
+# merge(unlist(df_garch), by =0)
+# cbindlist(df_garch)
+# df <- Reduce(
+#     function(x, y) join(x, y, by = "Parameter"),
+#     lapply(df_garch, function(x) { x$id <- rownames(x); x }))
+# df
+# tab_df(df,digits=4)
+# sjp.frq(residuals(garchfit))
+# plot_frq(as.data.frame(residuals(garchfit)), type = "line")
+# hist(residuals(garchfit))
+# ??sjp.frq
+# ?tab_model
+# ?tab_df
+```
+
+
+Generator function for the LSTM model. This function takes in predefined lookback back periods, prediction periods and generates batches to feed into the model. 
+Keras understands inputs directly from the function, thus the data is generated on the fly and RAM is saved. 
+```{r Generators}
+generator <- function(data,
+                      lookback,
+                      delay,
+                      min_index,
+                      max_index,
+                      batch_size,
+                      step) {
+  if (is.null(max_index))
+    max_index <- nrow(data) - delay - 1
+  i <- min_index + lookback
+  function() {
+     {
+      if (i + batch_size >= max_index)
+        i <<- min_index + lookback
+      rows <- c(i:min(i + batch_size - 1, max_index))
+      i <<- i + length(rows)
+    }
+    samples <- array(0, dim = c(length(rows),
+                                lookback / step,
+                                dim(data)[[-1]]))
+    targets <- array(0, dim = c(length(rows)))
+    
+    for (j in 1:length(rows)) {
+      indices <- seq(rows[[j]] - lookback, rows[[j]] - 1,
+                     length.out = dim(samples)[[2]])
+      samples[j, , ] <- data[indices, ]
+      targets[[j]] <- data[rows[[j]] + delay, 1]
+    }
+    list(samples, targets)
+  }
+}
+
+```
+
+Variable generator function, used to get all combinations of variables
+```{r}
+
+# variables = colnames(data)[-1]
+# n = 6
+# combinations = lapply(1:n, function(x)combn(1:n, x))
+# formulas = lapply(combinations, function(y){
+#   apply(y, 2, function(x){
+#     paste(paste(variables[x], collapse = ","), sep=",")
+#   })
+# })
+# 
+# formulas = lapply(combinations, function(y){
+#   apply(y, 2, function(x){
+#     paste(variables[x],  sep=",")
+#   })
+# })
+# formulas = unlist(formulas)
+# data[,unlist(strsplit(formulas[10],split = ","))]
+# unlist(strsplit(formulas[10],split = ","))
+# lapply(formulas,strsplit,split=",")
+# strsplit(formulas, split = ",")
+# library(stringr)
+# as.vector(str_split_fixed(formulas, pattern = ",", n = nchar(formulas)))
+```
+
+
+Data preprocessing
+
+Currency, dataset and time period can be selected
+"curr" selects one of the three cryptocurrencies
+"hour" is for the intraday timeframe, while "day" for the daily timeframe
+"rets" uses only return data, while "full" uses full set
+
+```{r}
+curr = "BTC"
+t_period = "day" #day #hour
+variab <- "rets" #rets # rets uses only return data, while full uses full set
+step <- 1
+batch_size <- 200
+train_split <- 0.45 #45% of data is used
+val_split <- 0.20 #20% validation
+#df_all <- data.frame()
+```
+
+
+```{r}
+df_all <- data.frame() #for some reason teh tables dont get saved in the loop, catch in dataframe, print later
+for (i in coin) {#for (j in c("hour")) { #
+#### get the data
+  curr = i
+  # t_period = j
+  # print(i)
+  # print(j)
+  
+dat_d <- get_d_data(curr)
+dat_h <- get_h_data(curr)
+dat_social <- get_social_dat(curr)
+dat_fun <- get_fun_dat(curr)
+dat_fee <- get_fee_dat(curr)
+####
+
+
+
+if (t_period=="hour"){
+dat_data <- prep_h_data(dat_h = dat_h,dat_fee = dat_fee,dat_fun = dat_fun,dat_social = dat_social)
+}
+if (t_period=="day"){
+dat_data <- prep_d_data(dat_d = dat_d,dat_fee = dat_fee,dat_fun = dat_fun,dat_social = dat_social)
+}
+#select vars
+if (variab == "full") {
+data <- data.matrix(dat_data[,c("rv","ret","v_chg","reddit_c_n","reddit_p_n","fee","funding")])
+
+head(data)
+}
+if (variab == "rets") {
+data <- data.matrix(dat_data[,c("rv","ret")])
+}
+
+
+
+
+
+
+if (t_period == "hour"){
+  delay <- 24
+  lookback <- 48
+}
+if (t_period == "day"){
+  delay <- 1
+  lookback <- 2
+}
+
+
+#variables <- c("rv","ret")
+#dat <- run_lstm(variables)
+#dat_all <- lapply(formulas[10:12],run_lstm)
+
+
+
+##################################################
+
+#train test split for normalization
+period_train <- train_split*nrow(data)
+data_train <- data[1:(train_split*nrow(data)),]
+#get train mean and sd
+mean_dat <- apply(data_train, 2, mean)
+std_dat <- apply(data_train, 2, sd)
+data <- scale(data, center = mean_dat, scale = std_dat)
+
+
+# #scale minmax
+# max_dat <- apply(data_train,2,max)
+# min_dat <- apply(data_train,2,min)
+# data <- sweep(data,2,min_dat,FUN = "-")
+# data <- sweep(data,2,(max_dat-min_dat),FUN = "/")
+
+#validation length
+val_start <- period_train+1
+val_end <- (train_split+val_split)*nrow(data)
+
+#test length
+test_start <- val_end+1
+test_end <- min(test_start+period_train*1,nrow(data))
+
+#steps
+val_steps <- (val_end - period_train+1 - lookback) / batch_size
+train_steps <- period_train / batch_size
+
+#start and end dates
+val_start_date <- rownames(data)[val_start]
+test_start_date <- rownames(data)[test_start]
+
+#define generators
+train_gen <- generator(
+  data,
+  lookback = lookback,
+  delay = delay,
+  min_index = 1,
+  max_index = period_train,
+  step = step,
+  batch_size = batch_size)
+
+val_gen = generator(
+  data,
+  lookback = lookback,
+  delay = delay,
+  min_index = val_start,
+  max_index = val_end,
+  step = step,
+  batch_size = batch_size
+)
+
+
+###the model ###
+
+model <- keras_model_sequential() %>%
+  layer_lstm(units = 12, input_shape = list(NULL, dim(data)[[-1]]),return_sequences = T, dropout=0.2) %>%
+  layer_lstm(units = 12, return_sequences = F, dropout = 0.2) %>%
+  layer_dense(units = 6, activation = "selu") %>%
+  layer_dense(units = 1, activation = "selu")
+
+model %>% compile(optimizer = "adam",
+                  loss= 'mse',
+                  )
+summary(model)
+callbacks <- list(
+  callback_early_stopping(patience = 10, monitor = 'val_loss',restore_best_weights=TRUE,min_delta = 0.001),
+  callback_tensorboard(log_dir = './logs')
+)
+?callback_early_stopping
+history <- model %>% fit(
+  train_gen,
+  steps_per_epoch = train_steps,
+  epochs = 100,
+  use_multiprocessing = T,
+  validation_data = val_gen,
+  validation_steps = val_steps,
+  callbacks = callbacks
+
+)
+
+#### test set ###########
+batch_size_plot = round(test_end-test_start-lookback)
+  lookback_plot <- lookback
+  step_plot <- 1 
+  
+  pred_gen <- generator(
+    data,
+    lookback = lookback,
+    delay = 0,
+    min_index = test_start,
+    max_index = test_end,
+    step = step_plot,
+    batch_size = batch_size_plot
+  )
+  
+ pred_gen_data <- pred_gen()
+  
+  V1 = seq(1, length(pred_gen_data[[2]]))
+  
+  plot_data <-
+    as.data.frame(cbind(V1, pred_gen_data[[2]]))
+  
+  inputdata <- pred_gen_data[[1]][,,]
+  dim(inputdata) <- c(batch_size_plot,lookback/step_plot,ncol(data))
+  
+  pred_out <- model %>%
+    predict(inputdata) 
+
+
+  plot_data <-
+    cbind(plot_data, pred_out[])
+  
+  #add back dates
+  plot_data$date <- index(dat_h)[(1+test_start):(test_start+nrow(pred_gen_data[[2]]))]
+  plot_data <- as.xts(plot_data[,-4],order.by = plot_data[,4])
+  colnames(plot_data)[3] <- "prediction"
+  
+  #decenter to get back original scale
+   decenter <- function(x,std,mean) {
+    return(x*std+mean)
+   }
+   plot_data$rv <- decenter(plot_data$V2,std_dat[1],mean_dat[1])
+   plot_data$rv_pred <- decenter(plot_data$prediction,std_dat[1],mean_dat[1])
+  autoplot(plot_data$rv)
+  p <- ggplot(plot_data, aes(x = index(plot_data), y = rv)) + geom_line( colour = "blue", size = 0.2,alpha=0.3)
+  p <- p + geom_point(aes(x = index(plot_data), y = rv_pred), colour = "red", size = 0.1 ,alpha=0.2) 
+  p <- p + theme(panel.background = element_rect(fill = 'white', colour = 'black'))
+  p <- p + labs(y = "RV", x = "Date") + ggtitle(paste0(curr," LSTM"))
+  p
+  ggsave(p, filename = paste0(path,"Plots/",curr,"_",t_period,"_",variab,"_LSTM.png"),height = 2, width = 9)  
+
+  #rmse
+  plot_data <- as.data.frame(plot_data)
+  acc_tab <- data.frame(t(accuracy(plot_data$rv_pred,plot_data$rv)))
+  print(acc_tab)
+  tab_df(acc_tab,digits=4,show.rownames = T,col.header = c(curr),
+         file = paste0(path,"Tables/",curr,"_",t_period,"_",variab,"_LSTM_acc_tab.doc"))
+  
+  df <- acc_tab
+  colnames(df) <- curr
+  df$Parameter <- rownames(df)
+  df <- df[,c(2,1)] #change row order
+  if (dim(df_all)[1] == 0){
+  df_all <- df
+  }else{
+ df_all <- join(df_all,df,by="Parameter") 
+  }
+
+  #acc_tab$Parameter
+  #acc_tab$variable <- toString(vars)
+  #acc_tab$currency <- curr
+  loss_p <- plot(history) + theme(panel.background = element_rect(fill = 'white', colour = 'black'))+ ggtitle(curr)
+  ggsave(loss_p, filename = paste0(path,"Plots/","loss_plot",curr,"_",t_period,"_",variab,"_LSTM.png"),height = 2, width = 9)  
+  
+}
+
+  tab_df(df_all,digits=4,show.rownames = F,col.header = c(curr))
+  
+  tab_df(df_all,digits=4,show.rownames = F,col.header = c(curr),
+         file = paste0(path,"Tables/","all","_",t_period,"_",variab,"_LSTM_acc_tab.doc"))
+  
+```
+
+
+
+
+
+
