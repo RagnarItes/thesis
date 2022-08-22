@@ -527,8 +527,7 @@ Simple GARCH model with no external regressors
 
 ```{r}
 curr = "BTC"
-out_sample_d = round(0.35*nrow(dat_d)) #35% of the data are used out of sample
-out_sample_h = round(0.35*nrow(dat_h)) #35% of the data are used out of sample
+
 
 #### get the data
 dat_d <- get_d_data(curr)
@@ -537,7 +536,8 @@ dat_social <- get_social_dat(curr)
 dat_fun <- get_fun_dat(curr)
 dat_fee <- get_fee_dat(curr)
 ####
-
+out_sample_d = round(0.35*nrow(dat_d)) #35% of the data are used out of sample
+out_sample_h = round(0.35*nrow(dat_h)) #35% of the data are used out of sample
 
 
 #Garch 1,1 model with zero mean
@@ -607,7 +607,7 @@ g_acc
     labs(y= "RV", x = "Date") + ggtitle(curr) 
   p <- p +  scale_x_date(date_breaks = "3 month",date_labels = "%Y %b")
   p 
-  ggsave(p, filename = paste0(path,"Plots/",curr,"_simple_garch.png"),height = 3, width = 9)  
+
 
   #scatterplot remove one outlier
   g_fc <- g_fc[which(!g_fc$rv==max(g_fc$rv)),] 
@@ -617,8 +617,6 @@ g_acc
 #extract garch params and print table  
 g_tab <- extract.rugarch(garchfit)
 
-tab_dfs(list(g_tab[[1]],g_tab[[2]]),title=c(curr,curr),
-        file = paste0(path,"Tables/",curr,"simple_garch.doc"))
 
 
 
